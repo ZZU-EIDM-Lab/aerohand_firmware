@@ -1,3 +1,5 @@
+// Based on Chestnut Robotics Aero Hand Open firmware.
+// Modified in this repository: post-homing servo handling and thumb posture.
 #include "Homing.h"
 #include "HandConfig.h"
 

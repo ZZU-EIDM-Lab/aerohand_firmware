@@ -1,5 +1,7 @@
 // Chestnut Robotics - Open Source Hand
 // Aero Hand Firmware Source Code
+// Modified in this repository: standalone PlatformIO build, default torque,
+// and per-servo metric validity reporting.
 #include <Arduino.h>
 #include <Wire.h>
 #include <HLSCL.h>
