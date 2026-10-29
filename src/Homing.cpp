@@ -220,8 +220,14 @@ void zero_all_motors() {
   zero_with_current(1,  sd[1].servo_direction, 950);   // Thumb Flex
   zero_with_current(2,  sd[2].servo_direction, 950);   // Thumb Tendon
   zero_fingers_parallel_with_current(3, 4, 950);       // Fingers together
+  // The thumb abduction home position is 0.8 on the same extend-to-grasp
+  // scale used by CTRL_POS (0 = extend, 1 = grasp).
+  const int32_t thumb_abduction_home =
+      (int32_t)sd[0].extend_count +
+      4L * ((int32_t)sd[0].grasp_count - sd[0].extend_count) / 5L;
+
   // Post-homing settling moves
-  hlscl.WritePosEx(SERVO_IDS[0], sd[0].extend_count, 2400, 0, 1023);   // Thumb Abduction to extend
+  hlscl.WritePosEx(SERVO_IDS[0], thumb_abduction_home, 2400, 0, 1023);
   hlscl.WritePosEx(SERVO_IDS[1], sd[1].extend_count, 2400, 0, 1023);   // Thumb Flexion to extend
   hlscl.WritePosEx(SERVO_IDS[2], sd[2].extend_count, 2400, 0, 1023);   // Thumb Tendon to extend
   hlscl.WritePosEx(SERVO_IDS[3], sd[3].extend_count, 2400, 0, 1023);   // Index to extend
