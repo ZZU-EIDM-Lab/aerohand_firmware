@@ -57,6 +57,7 @@ static uint16_t HOT_TORQUE_LIMIT = 500;   // clamp torque when motor exceeds TEM
 #define SCAN_MAX               253
 #define REG_BLOCK_LEN          15
 #define REG_BLOCK_START        56
+static const uint8_t METRICS_VALIDITY_FLAG = 0x80;
 
 // ----- Structure for the Metrics of Servo -------
 struct ServoMetrics {
@@ -64,6 +65,7 @@ struct ServoMetrics {
   uint16_t vel[7];
   uint16_t cur[7];
   uint16_t tmp[7];
+  uint8_t validMask;
 };
 static ServoMetrics gMetrics;
 
@@ -84,9 +86,10 @@ void HOMING_start();
 
 // ---- Helper function to read latest temp from servo
 static inline uint8_t getTempC(uint8_t ch) {
-  uint8_t t = 0;
+  // A missing temperature reading must not disable thermal torque limiting.
+  uint8_t t = TEMP_CUTOFF_C;
   if (gMetricsMux) xSemaphoreTake(gMetricsMux, portMAX_DELAY);
-  t = (uint8_t)gMetrics.tmp[ch];
+  if (gMetrics.validMask & (1u << ch)) t = (uint8_t)gMetrics.tmp[ch];
   if (gMetricsMux) xSemaphoreGive(gMetricsMux);
   return t;
 }
@@ -245,15 +248,24 @@ static inline void copy7_u16(uint16_t dst[7], const uint16_t src[7]) {
 }
 
 // ----- Helper function to send u16 frame for POS,SPD,VEL,CURR and sendACK Packet ----
-static inline void sendU16Frame(uint8_t header, const uint16_t data[7]) {
+static inline void sendU16Frame(uint8_t header, const uint16_t data[7], uint8_t flags = 0) {
   uint8_t out[2 + 7*2];
   out[0] = header;
-  out[1] = 0x00; // filler
+  out[1] = flags;
   for (int i = 0; i < 7; ++i) {
     out[2 + 2*i + 0] = (uint8_t)(data[i] & 0xFF);
     out[2 + 2*i + 1] = (uint8_t)((data[i] >> 8) & 0xFF);
   }
   Serial.write(out, sizeof(out)); 
+}
+
+static inline void sendMetricsFrame(uint8_t header, uint16_t data[7], uint8_t validMask) {
+  // Bit 7 marks the presence of a validity mask; bits 0..6 identify replies.
+  // Keep invalid slots zero for clients that do not understand the mask.
+  for (uint8_t i = 0; i < 7; ++i) {
+    if (!(validMask & (1u << i))) data[i] = 0;
+  }
+  sendU16Frame(header, data, METRICS_VALIDITY_FLAG | validMask);
 }
 static inline void sendAckFrame(uint8_t header, const uint8_t* payload, size_t n) {
   uint8_t out[16];
@@ -270,31 +282,39 @@ static inline void sendAckFrame(uint8_t header, const uint8_t* payload, size_t n
 // ----- Functions to Send POS, VEL, CURR, TEMP -----
 void sendPositions() {
   uint16_t buf[7];
+  uint8_t validMask;
   xSemaphoreTake(gMetricsMux, portMAX_DELAY);
   copy7_u16(buf, gMetrics.pos);
+  validMask = gMetrics.validMask;
   xSemaphoreGive(gMetricsMux);
-  sendU16Frame(GET_POS, buf);
+  sendMetricsFrame(GET_POS, buf, validMask);
 }
 void sendVelocities() {
   uint16_t buf[7];
+  uint8_t validMask;
   xSemaphoreTake(gMetricsMux, portMAX_DELAY);
   copy7_u16(buf, gMetrics.vel);
+  validMask = gMetrics.validMask;
   xSemaphoreGive(gMetricsMux);
-  sendU16Frame(GET_VEL, buf);
+  sendMetricsFrame(GET_VEL, buf, validMask);
 }
 void sendCurrents() {
   uint16_t buf[7];
+  uint8_t validMask;
   xSemaphoreTake(gMetricsMux, portMAX_DELAY);
   copy7_u16(buf, gMetrics.cur);
+  validMask = gMetrics.validMask;
   xSemaphoreGive(gMetricsMux);
-  sendU16Frame(GET_CURR, buf);
+  sendMetricsFrame(GET_CURR, buf, validMask);
 }
 void sendTemps() {
   uint16_t buf[7];
+  uint8_t validMask;
   xSemaphoreTake(gMetricsMux, portMAX_DELAY);
   copy7_u16(buf, gMetrics.tmp);
+  validMask = gMetrics.validMask;
   xSemaphoreGive(gMetricsMux);
-  sendU16Frame(GET_TEMP, buf);
+  sendMetricsFrame(GET_TEMP, buf, validMask);
 }
 
 // ----- Task - Sync Read running always on Core 1 ----- 
@@ -309,29 +329,33 @@ static void TaskSyncRead_Core1(void *arg) {
       vTaskDelayUntil(&nextWake, period);
       continue;
     }
-    bool ok = true;
+    uint8_t validMask = 0;
     // one TX for the whole group (15-byte slice)
     hlscl.syncReadPacketTx((uint8_t*)SERVO_IDS, 7, REG_BLOCK_START, REG_BLOCK_LEN);
     for (uint8_t i = 0; i < 7; ++i) {
-      if (!hlscl.syncReadPacketRx(SERVO_IDS[i], rx)) { ok = false; break; }
+      // Each ID is searched independently in the received buffer. A missing
+      // servo must not discard the replies from the remaining six.
+      if (hlscl.syncReadPacketRx(SERVO_IDS[i], rx) != REG_BLOCK_LEN) continue;
       uint16_t raw = leu_u16(&rx[0]);
       pos[i] = mapRawToU16(i,raw);                     // Position (unsigned)
       vel[i] = decode_signmag15(rx[2], rx[3]);                  // velocity (signed)
       tmp[i] = rx[7];                                           // temperature (unsigned, 1 byte)
       cur[i] = decode_signmag15(rx[13], rx[14]);                // current (signed)
+      validMask |= (1u << i);
       //vTaskDelay(1);
     }
     if (gBusMux) xSemaphoreGive(gBusMux);
-    if (ok) {
-      xSemaphoreTake(gMetricsMux, portMAX_DELAY);
-      for (int i = 0; i < 7; ++i) {
+    xSemaphoreTake(gMetricsMux, portMAX_DELAY);
+    gMetrics.validMask = validMask;
+    for (int i = 0; i < 7; ++i) {
+      if (validMask & (1u << i)) {
         gMetrics.pos[i] = pos[i];
         gMetrics.vel[i] = vel[i];
         gMetrics.tmp[i] = tmp[i];
         gMetrics.cur[i] = cur[i];
       }
-      xSemaphoreGive(gMetricsMux);
-    } 
+    }
+    xSemaphoreGive(gMetricsMux);
     vTaskDelayUntil(&nextWake, period);
   }
 }
